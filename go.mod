@@ -1,4 +1,4 @@
-module github.com/danielgtaylor/apisprout
+module github.com/johejo/apisprout
 
 go 1.12
 

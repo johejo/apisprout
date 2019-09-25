@@ -1,0 +1,50 @@
+diff --git a/apisprout.go b/apisprout.go
+index 99816c5..7508cc0 100644
+--- a/apisprout.go
++++ b/apisprout.go
+@@ -1,4 +1,4 @@
+-package main
++package apisprout
+ 
+ import (
+ 	"context"
+diff --git a/apisprout_test.go b/apisprout_test.go
+index e065a30..a05a60d 100644
+--- a/apisprout_test.go
++++ b/apisprout_test.go
+@@ -1,4 +1,4 @@
+-package main
++package apisprout
+ 
+ import (
+ 	"testing"
+diff --git a/example.go b/example.go
+index b2d13ba..b7ec5a5 100644
+--- a/example.go
++++ b/example.go
+@@ -1,4 +1,4 @@
+-package main
++package apisprout
+ 
+ import (
+ 	"fmt"
+diff --git a/example_test.go b/example_test.go
+index 941b687..3263614 100644
+--- a/example_test.go
++++ b/example_test.go
+@@ -1,4 +1,4 @@
+-package main
++package apisprout
+ 
+ import (
+ 	"encoding/json"
+diff --git a/go.mod b/go.mod
+index a647135..08f8dce 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,4 +1,4 @@
+-module github.com/danielgtaylor/apisprout
++module github.com/johejo/apisprout
+ 
+ go 1.12
+ 
