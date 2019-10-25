@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,9 @@ var (
 	// ErrNoExample is sent when no example was found for an operation.
 	ErrNoExample = errors.New("No example found")
 
+	// ErrRecursive is when a schema is impossible to represent because it infinitely recurses.
+	ErrRecursive = errors.New("Recursive schema")
+
 	// ErrCannotMarshal is set when an example cannot be marshalled.
 	ErrCannotMarshal = errors.New("Cannot marshal example")
 
@@ -41,6 +45,27 @@ var (
 	// one is required by the API description.
 	ErrMissingAuth = errors.New("Missing auth")
 )
+
+var (
+	marshalJSONMatcher = regexp.MustCompile(`^application/(vnd\..+\+)?json$`)
+	marshalYAMLMatcher = regexp.MustCompile(`^(application|text)/(x-|vnd\..+\+)?yaml$`)
+)
+
+type RefreshableRouter struct {
+	router *openapi3filter.Router
+}
+
+func (rr *RefreshableRouter) Set(router *openapi3filter.Router) {
+	rr.router = router
+}
+
+func (rr *RefreshableRouter) Get() *openapi3filter.Router {
+	return rr.router
+}
+
+func NewRefreshableRouter() *RefreshableRouter {
+	return &RefreshableRouter{}
+}
 
 // ContentNegotiator is used to match a media type during content negotiation
 // of HTTP requests.
@@ -115,6 +140,9 @@ func main() {
 	addParameter(flags, "disable-cors", "", false, "Disable CORS headers")
 	addParameter(flags, "header", "H", "", "Add a custom header when fetching API")
 	addParameter(flags, "add-server", "", "", "Add a new valid server URL, use with --validate-server")
+	addParameter(flags, "https", "", false, "Use HTTPS instead of HTTP")
+	addParameter(flags, "public-key", "", "", "Public key for HTTPS, use with --https")
+	addParameter(flags, "private-key", "", "", "Private key for HTTPS, use with --https")
 
 	// Run the app!
 	root.Execute()
@@ -137,21 +165,32 @@ func addParameter(flags *pflag.FlagSet, name, short string, def interface{}, des
 
 // getTypedExample will return an example from a given media type, if such an
 // example exists. If multiple examples are given, then one is selected at
-// random.
-func getTypedExample(mt *openapi3.MediaType) (interface{}, error) {
+// random unless an "example" item exists in the Prefer header
+func getTypedExample(mt *openapi3.MediaType, prefer map[string]string) (interface{}, error) {
 	if mt.Example != nil {
 		return mt.Example, nil
 	}
 
 	if len(mt.Examples) > 0 {
+		// If preferred example requested and it it exists, return it
+		preferredExample := ""
+		if mapContainsKey(prefer, "example") {
+			preferredExample = prefer["example"]
+			if _, ok := mt.Examples[preferredExample]; ok {
+				return mt.Examples[preferredExample].Value.Value, nil
+			}
+		}
+
 		// Choose a random example to return.
 		keys := make([]string, 0, len(mt.Examples))
 		for k := range mt.Examples {
 			keys = append(keys, k)
 		}
 
-		selected := keys[rand.Intn(len(keys))]
-		return mt.Examples[selected].Value.Value, nil
+		if len(keys) > 0 {
+			selected := keys[rand.Intn(len(keys))]
+			return mt.Examples[selected].Value.Value, nil
+		}
 	}
 
 	if mt.Schema != nil {
@@ -163,11 +202,12 @@ func getTypedExample(mt *openapi3.MediaType) (interface{}, error) {
 }
 
 // getExample tries to return an example for a given operation.
-func getExample(negotiator *ContentNegotiator, prefer string, op *openapi3.Operation) (int, string, map[string]*openapi3.HeaderRef, interface{}, error) {
+// Using the Prefer http header, the consumer can specify the type of response they want.
+func getExample(negotiator *ContentNegotiator, prefer map[string]string, op *openapi3.Operation) (int, string, map[string]*openapi3.HeaderRef, interface{}, error) {
 	var responses []string
 	var blankHeaders = make(map[string]*openapi3.HeaderRef)
 
-	if prefer == "" {
+	if !mapContainsKey(prefer, "status") {
 		// First, make a list of responses ordered by successful (200-299 status code)
 		// before other types.
 		success := make([]string, 0)
@@ -180,11 +220,12 @@ func getExample(negotiator *ContentNegotiator, prefer string, op *openapi3.Opera
 			other = append(other, s)
 		}
 		responses = append(success, other...)
+	} else if op.Responses[prefer["status"]] != nil {
+		responses = []string{prefer["status"]}
+	} else if op.Responses["default"] != nil {
+		responses = []string{"default"}
 	} else {
-		if op.Responses[prefer] == nil {
-			return 0, "", blankHeaders, nil, ErrNoExample
-		}
-		responses = []string{prefer}
+		return 0, "", blankHeaders, nil, ErrNoExample
 	}
 
 	// Now try to find the first example we can and return it!
@@ -192,7 +233,12 @@ func getExample(negotiator *ContentNegotiator, prefer string, op *openapi3.Opera
 		response := op.Responses[s]
 		status, err := strconv.Atoi(s)
 		if err != nil {
-			// Treat default and other named statuses as 200.
+			// If we are using the default with prefer, we can use its status
+			// code:
+			status, err = strconv.Atoi(prefer["status"])
+		}
+		if err != nil {
+			// Otherwise, treat default and other named statuses as 200.
 			status = http.StatusOK
 		}
 
@@ -207,7 +253,7 @@ func getExample(negotiator *ContentNegotiator, prefer string, op *openapi3.Opera
 				continue
 			}
 
-			example, err := getTypedExample(content)
+			example, err := getTypedExample(content, prefer)
 			if err == nil {
 				return status, mt, response.Value.Headers, example, nil
 			}
@@ -311,16 +357,240 @@ func load(uri string, data []byte) (swagger *openapi3.Swagger, router *openapi3f
 	return
 }
 
+// parsePreferHeader takes the value of a prefer header and splits it out into key value pairs
+//
+// HTTP Prefer header specification examples:
+// - Prefer: status=200; example="something"
+// - Prefer: example=something;status=200;
+// - Prefer: example="somet,;hing";status=200;
+//
+// As part of the Prefer specification, it is completely valid to specify
+// multiple Prefer headers in a single request, however we won't be
+// supporting that for the moment and only the first Prefer header
+// will be used.
+func parsePreferHeader(value string) map[string]string {
+	prefer := map[string]string{}
+	if value != "" {
+		// In the event that something is quoted, we want to pull those items out of the string
+		// and save them for later, so they don't conflict with other splitting logic.
+
+		quotedRegex := regexp.MustCompile(`"[^"]*"`)
+		splitRegex := regexp.MustCompile(`(,|;| )`)
+		wilcardRegex := regexp.MustCompile(`%%([0-9]+)%%`)
+
+		quotedStrings := quotedRegex.FindAllString(value, -1)
+		if len(quotedStrings) > 0 {
+			// replace each quoted string with a placehoder
+			for idx, quotedString := range quotedStrings {
+				value = strings.Replace(value, quotedString, fmt.Sprintf("%%%%%v%%%%", idx), 1)
+			}
+		}
+
+		pairs := splitRegex.Split(value, -1)
+		for _, pair := range pairs {
+			pair = strings.TrimSpace(pair)
+			if pair != "" {
+				// Put any wildcards back
+				wildcardStrings := wilcardRegex.FindAllStringSubmatch(pair, -1)
+				for _, wildcard := range wildcardStrings {
+					quotedIdx, _ := strconv.Atoi(wildcard[1])
+					pair = strings.Replace(pair, wildcard[0], quotedStrings[quotedIdx], 1)
+				}
+
+				// Determine the key and valid for this argument
+				if strings.Contains(pair, "=") {
+					eqIdx := strings.Index(pair, "=")
+					prefer[pair[:eqIdx]] = strings.Trim(pair[eqIdx+1:], `"`)
+				} else {
+					prefer[pair] = ""
+				}
+			}
+		}
+	}
+	return prefer
+}
+
+func mapContainsKey(dict map[string]string, key string) bool {
+	if _, ok := dict[key]; ok {
+		return true
+	}
+	return false
+}
+
+var handler = func(rr *RefreshableRouter) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if !viper.GetBool("disable-cors") {
+			corsOrigin := req.Header.Get("Origin")
+			if corsOrigin == "" {
+				corsOrigin = "*"
+			}
+			w.Header().Set("Access-Control-Allow-Origin", corsOrigin)
+
+			if corsOrigin != "*" {
+				// Allow credentials to be sent if an origin has  been specified.
+				// This is done *outside* of an OPTIONS request since it might be
+				// required for a non-preflighted GET/POST request.
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+
+			// Handle pre-flight OPTIONS request
+			if (*req).Method == "OPTIONS" {
+				corsMethod := req.Header.Get("Access-Control-Request-Method")
+				if corsMethod == "" {
+					corsMethod = "POST, GET, OPTIONS, PUT, DELETE"
+				}
+
+				corsHeaders := req.Header.Get("Access-Control-Request-Headers")
+				if corsHeaders == "" {
+					corsHeaders = "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization"
+				}
+
+				w.Header().Set("Access-Control-Allow-Methods", corsMethod)
+				w.Header().Set("Access-Control-Allow-Headers", corsHeaders)
+				return
+			}
+		}
+
+		info := fmt.Sprintf("%s %v", req.Method, req.URL)
+
+		// Set up the request, handling potential proxy headers
+		req.URL.Host = req.Host
+		fHost := req.Header.Get("X-Forwarded-Host")
+		if fHost != "" {
+			req.URL.Host = fHost
+		}
+
+		req.URL.Scheme = "http"
+		if req.Header.Get("X-Forwarded-Proto") == "https" ||
+			req.Header.Get("X-Forwarded-Scheme") == "https" ||
+			strings.Contains(req.Header.Get("Forwarded"), "proto=https") {
+			req.URL.Scheme = "https"
+		}
+
+		if viper.GetBool("validate-server") {
+			// Use the scheme/host in the log message since we are validating it.
+			info = fmt.Sprintf("%s %v", req.Method, req.URL)
+		}
+
+		route, pathParams, err := rr.Get().FindRoute(req.Method, req.URL)
+		if err != nil {
+			log.Printf("ERROR: %s => %v", info, err)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		if viper.GetBool("validate-request") {
+			err = openapi3filter.ValidateRequest(nil, &openapi3filter.RequestValidationInput{
+				Request:    req,
+				Route:      route,
+				PathParams: pathParams,
+				Options: &openapi3filter.Options{
+					AuthenticationFunc: func(c context.Context, input *openapi3filter.AuthenticationInput) error {
+						// TODO: support more schemes
+						sec := input.SecurityScheme
+						if sec.Type == "http" && sec.Scheme == "bearer" {
+							if req.Header.Get("Authorization") == "" {
+								return ErrMissingAuth
+							}
+						}
+						return nil
+					},
+				},
+			})
+			if err != nil {
+				log.Printf("ERROR: %s => %v", info, err)
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte(fmt.Sprintf("%v", err)))
+				return
+			}
+		}
+
+		var negotiator *ContentNegotiator
+		if accept := req.Header.Get("Accept"); accept != "" {
+			negotiator = NewContentNegotiator(accept)
+			if accept != "*/*" {
+				info = fmt.Sprintf("%s (Accept %s)", info, accept)
+			}
+		}
+
+		prefer := parsePreferHeader(req.Header.Get("Prefer"))
+
+		status, mediatype, headers, example, err := getExample(negotiator, prefer, route.Operation)
+		if err != nil {
+			log.Printf("%s => Missing example", info)
+			w.WriteHeader(http.StatusTeapot)
+			w.Write([]byte("No example available."))
+			return
+		}
+
+		id := route.Operation.OperationID
+		if id == "" {
+			id = route.Operation.Summary
+		}
+
+		log.Printf("%s (%s) => %d (%s)", info, id, status, mediatype)
+
+		var encoded []byte
+
+		if s, ok := example.(string); ok {
+			encoded = []byte(s)
+		} else if _, ok := example.([]byte); ok {
+			encoded = example.([]byte)
+		} else {
+			if marshalJSONMatcher.MatchString(mediatype) {
+				encoded, err = json.MarshalIndent(example, "", "  ")
+			} else if marshalYAMLMatcher.MatchString(mediatype) {
+				encoded, err = yaml.Marshal(example)
+			} else {
+				log.Printf("Cannot marshal as '%s'!", mediatype)
+				err = ErrCannotMarshal
+			}
+
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte("Unable to marshal response"))
+				return
+			}
+		}
+
+		for name, header := range headers {
+			if header.Value != nil {
+				example := name
+
+				if header.Value.Schema != nil && header.Value.Schema.Value != nil {
+					if v, err := OpenAPIExample(ModeResponse, header.Value.Schema.Value); err == nil {
+						if vs, ok := v.(string); ok {
+							example = vs
+						} else {
+							fmt.Printf("Could not convert example value '%v' to string", v)
+						}
+					}
+				}
+
+				w.Header().Set(name, example)
+			}
+		}
+
+		if mediatype != "" {
+			w.Header().Set("Content-Type", mediatype)
+		}
+
+		w.WriteHeader(status)
+		w.Write(encoded)
+	})
+}
+
 // server loads an OpenAPI file and runs a mock server using the paths and
 // examples defined in the file.
 func server(cmd *cobra.Command, args []string) {
 	var swagger *openapi3.Swagger
-	var router *openapi3filter.Router
+	rr := NewRefreshableRouter()
 
 	uri := args[0]
 
 	var err error
 	var data []byte
+	dataType := strings.Trim(strings.ToLower(filepath.Ext(uri)), ".")
 
 	// Load either from an HTTP URL or from a local file depending on the passed
 	// in value.
@@ -385,7 +655,7 @@ func server(cmd *cobra.Command, args []string) {
 
 							if s, r, err := load(uri, data); err == nil {
 								swagger = s
-								router = r
+								rr.Set(r)
 							} else {
 								log.Printf("ERROR: Unable to load OpenAPI document: %s", err)
 							}
@@ -403,10 +673,12 @@ func server(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	swagger, router, err = load(uri, data)
+	swagger, router, err := load(uri, data)
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	rr.Set(router)
 
 	if strings.HasPrefix(uri, "http") {
 		http.HandleFunc("/__reload", func(w http.ResponseWriter, r *http.Request) {
@@ -429,7 +701,7 @@ func server(cmd *cobra.Command, args []string) {
 
 			if s, r, err := load(uri, data); err == nil {
 				swagger = s
-				router = r
+				rr.Set(r)
 			}
 
 			w.WriteHeader(200)
@@ -438,176 +710,36 @@ func server(cmd *cobra.Command, args []string) {
 		})
 	}
 
-	// Register our custom HTTP handler that will use the router to find
-	// the appropriate OpenAPI operation and try to return an example.
-	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+	// Add a health check route which returns 200
+	http.HandleFunc("/__health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		log.Printf("Health check")
+	})
+
+	// Another custom handler to return the exact swagger document given to us
+	http.HandleFunc("/__schema", func(w http.ResponseWriter, req *http.Request) {
 		if !viper.GetBool("disable-cors") {
 			corsOrigin := req.Header.Get("Origin")
 			if corsOrigin == "" {
 				corsOrigin = "*"
 			}
 			w.Header().Set("Access-Control-Allow-Origin", corsOrigin)
-
-			if corsOrigin != "*" {
-				// Allow credentials to be sent if an origin has  been specified.
-				// This is done *outside* of an OPTIONS request since it might be
-				// required for a non-preflighted GET/POST request.
-				w.Header().Set("Access-Control-Allow-Credentials", "true")
-			}
-
-			// Handle pre-flight OPTIONS request
-			if (*req).Method == "OPTIONS" {
-				corsMethod := req.Header.Get("Access-Control-Request-Method")
-				if corsMethod == "" {
-					corsMethod = "POST, GET, OPTIONS, PUT, DELETE"
-				}
-
-				corsHeaders := req.Header.Get("Access-Control-Request-Headers")
-				if corsHeaders == "" {
-					corsHeaders = "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization"
-				}
-
-				w.Header().Set("Access-Control-Allow-Methods", corsMethod)
-				w.Header().Set("Access-Control-Allow-Headers", corsHeaders)
-				return
-			}
 		}
 
-		info := fmt.Sprintf("%s %v", req.Method, req.URL)
-
-		// Set up the request, handling potential proxy headers
-		req.URL.Host = req.Host
-		fHost := req.Header.Get("X-Forwarded-Host")
-		if fHost != "" {
-			req.URL.Host = fHost
-		}
-
-		req.URL.Scheme = "http"
-		if req.Header.Get("X-Forwarded-Proto") == "https" ||
-			req.Header.Get("X-Forwarded-Scheme") == "https" ||
-			strings.Contains(req.Header.Get("Forwarded"), "proto=https") {
-			req.URL.Scheme = "https"
-		}
-
-		if viper.GetBool("validate-server") {
-			// Use the scheme/host in the log message since we are validating it.
-			info = fmt.Sprintf("%s %v", req.Method, req.URL)
-		}
-
-		route, pathParams, err := router.FindRoute(req.Method, req.URL)
-		if err != nil {
-			log.Printf("ERROR: %s => %v", info, err)
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		if viper.GetBool("validate-request") {
-			err = openapi3filter.ValidateRequest(nil, &openapi3filter.RequestValidationInput{
-				Request:    req,
-				Route:      route,
-				PathParams: pathParams,
-				Options: &openapi3filter.Options{
-					AuthenticationFunc: func(c context.Context, input *openapi3filter.AuthenticationInput) error {
-						// TODO: support more schemes
-						sec := input.SecurityScheme
-						if sec.Type == "http" && sec.Scheme == "bearer" {
-							if req.Header.Get("Authorization") == "" {
-								return ErrMissingAuth
-							}
-						}
-						return nil
-					},
-				},
-			})
-			if err != nil {
-				log.Printf("ERROR: %s => %v", info, err)
-				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte(fmt.Sprintf("%v", err)))
-				return
-			}
-		}
-
-		var negotiator *ContentNegotiator
-		if accept := req.Header.Get("Accept"); accept != "" {
-			negotiator = NewContentNegotiator(accept)
-			if accept != "*/*" {
-				info = fmt.Sprintf("%s (Accept %s)", info, accept)
-			}
-		}
-
-		prefer := req.Header.Get("Prefer")
-		if strings.HasPrefix(prefer, "status=") {
-			prefer = prefer[7:10]
-		} else {
-			prefer = ""
-		}
-
-		status, mediatype, headers, example, err := getExample(negotiator, prefer, route.Operation)
-		if err != nil {
-			log.Printf("%s => Missing example", info)
-			w.WriteHeader(http.StatusTeapot)
-			w.Write([]byte("No example available."))
-			return
-		}
-
-		id := route.Operation.OperationID
-		if id == "" {
-			id = route.Operation.Summary
-		}
-
-		log.Printf("%s (%s) => %d (%s)", info, id, status, mediatype)
-
-		var encoded []byte
-
-		if s, ok := example.(string); ok {
-			encoded = []byte(s)
-		} else if _, ok := example.([]byte); ok {
-			encoded = example.([]byte)
-		} else {
-			switch mediatype {
-			case "application/json", "application/vnd.api+json":
-				encoded, err = json.MarshalIndent(example, "", "  ")
-			case "application/x-yaml", "application/yaml", "text/x-yaml", "text/yaml", "text/vnd.yaml":
-				encoded, err = yaml.Marshal(example)
-			default:
-				log.Printf("Cannot marshal as '%s'!", mediatype)
-				err = ErrCannotMarshal
-			}
-
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte("Unable to marshal response"))
-				return
-			}
-		}
-
-		for name, header := range headers {
-			if header.Value != nil {
-				example := name
-
-				if header.Value.Schema != nil && header.Value.Schema.Value != nil {
-					if v, err := OpenAPIExample(ModeResponse, header.Value.Schema.Value); err == nil {
-						if vs, ok := v.(string); ok {
-							example = vs
-						} else {
-							fmt.Printf("Could not convert example value '%v' to string", v)
-						}
-					}
-				}
-
-				w.Header().Set(name, example)
-			}
-		}
-
-		if mediatype != "" {
-			w.Header().Set("Content-Type", mediatype)
-		}
-
-		w.WriteHeader(status)
-		w.Write(encoded)
+		w.Header().Set("Content-Type", fmt.Sprintf("application/%v; charset=utf-8", dataType))
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, string(data))
 	})
 
-	fmt.Printf("🌱 Sprouting %s on port %d", swagger.Info.Title, viper.GetInt("port"))
+	// Register our custom HTTP handler that will use the router to find
+	// the appropriate OpenAPI operation and try to return an example.
+	http.Handle("/", handler(rr))
+
+	format := "🌱 Sprouting %s on port %d"
+	if viper.GetBool("https") {
+		format = "🌱 Securely sprouting %s on port %d"
+	}
+	fmt.Printf(format, swagger.Info.Title, viper.GetInt("port"))
 
 	if viper.GetBool("validate-server") && len(swagger.Servers) != 0 {
 		fmt.Printf(" with valid servers:\n")
@@ -618,5 +750,14 @@ func server(cmd *cobra.Command, args []string) {
 		fmt.Printf("\n")
 	}
 
-	http.ListenAndServe(fmt.Sprintf(":%d", viper.GetInt("port")), nil)
+	port := fmt.Sprintf(":%d", viper.GetInt("port"))
+	if viper.GetBool("https") {
+		err = http.ListenAndServeTLS(port, viper.GetString("public-key"),
+			viper.GetString("private-key"), nil)
+	} else {
+		err = http.ListenAndServe(port, nil)
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
 }
